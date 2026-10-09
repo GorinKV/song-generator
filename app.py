@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -8,7 +9,7 @@ app = Flask(__name__)
 CORS(app)
 
 # --- API ключи из переменных окружения ---
-GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "")   # Authorization key (Base64)
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "")
 ACE_MUSIC_API_KEY = os.getenv("ACE_MUSIC_API_KEY", "")
 
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -22,21 +23,18 @@ def get_gigachat_token():
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
         "RqUID": str(uuid.uuid4()),
-        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",  # ключ уже в Base64
+        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
     }
     data = {"scope": "GIGACHAT_API_PERS", "grant_type": "client_credentials"}
     try:
         resp = requests.post(
-            GIGACHAT_OAUTH_URL,
-            headers=headers,
-            data=data,
-            verify=False,
-            timeout=30,
+            GIGACHAT_OAUTH_URL, headers=headers, data=data,
+            verify=False, timeout=30,
         )
         resp.raise_for_status()
         return resp.json().get("access_token")
     except Exception as e:
-        print(f"Ошибка получения токена GigaChat: {e}")
+        print(f"[GigaChat] Ошибка получения токена: {e}")
         return None
 
 
@@ -87,6 +85,62 @@ def generate_lyrics(theme, genre="pop"):
         return f"Ошибка генерации текста: {e}"
 
 
+def find_audio_base64(data, depth=0):
+    """
+    Рекурсивно ищет base64-аудио в ответе ACE Music.
+    Обрабатывает любую структуру: dict, list, вложенные комбинации.
+    """
+    if depth > 10:  # защита от бесконечной рекурсии
+        return None
+
+    if isinstance(data, dict):
+        # 1. Прямое поле "audio"
+        if "audio" in data:
+            audio = data["audio"]
+            result = extract_audio_value(audio)
+            if result:
+                return result
+
+        # 2. Поле "data" — если это длинная строка base64
+        if "data" in data and isinstance(data["data"], str):
+            if len(data["data"]) > 500:  # base64-аудио всегда длинное
+                return data["data"]
+
+        # 3. Рекурсивно обходим все значения
+        for key, value in data.items():
+            result = find_audio_base64(value, depth + 1)
+            if result:
+                return result
+
+    elif isinstance(data, list):
+        for item in data:
+            result = find_audio_base64(item, depth + 1)
+            if result:
+                return result
+
+    return None
+
+
+def extract_audio_value(audio):
+    """Извлекает base64-строку из значения поля 'audio' (может быть str/dict/list)."""
+    if isinstance(audio, str) and len(audio) > 500:
+        return audio
+    if isinstance(audio, dict):
+        if "data" in audio and isinstance(audio["data"], str):
+            return audio["data"]
+        # На случай вложенности {"audio": {"audio": {...}}}
+        for v in audio.values():
+            result = extract_audio_value(v)
+            if result:
+                return result
+    if isinstance(audio, list):
+        for item in audio:
+            result = extract_audio_value(item)
+            if result:
+                return result
+    return None
+
+
 def generate_music(lyrics, prompt, duration=30):
     """Генерирует музыку с вокалом через ACE Music API."""
     if not ACE_MUSIC_API_KEY:
@@ -96,8 +150,6 @@ def generate_music(lyrics, prompt, duration=30):
         "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
         "Content-Type": "application/json",
     }
-
-    # Промпт уже обёрнут в <prompt>...</prompt> в вызывающем коде
     payload = {
         "model": "acemusic/acestep-v15-turbo",
         "messages": [{
@@ -116,32 +168,37 @@ def generate_music(lyrics, prompt, duration=30):
         resp = requests.post(ACE_MUSIC_URL, headers=headers, json=payload, timeout=300)
 
         if resp.status_code == 504:
-            return None, "ACE Music API: таймаут (504). Попробуй увеличить длительность или повторить позже."
+            return None, "ACE Music API: таймаут (504). Увеличь длительность или повтори позже."
         if resp.status_code == 401:
-            return None, "ACE Music API: неверный ключ (401). Проверь ACE_MUSIC_API_KEY."
+            return None, "ACE Music API: неверный ключ (401)."
         if resp.status_code == 429:
             return None, "ACE Music API: превышен лимит запросов (429)."
 
         resp.raise_for_status()
         data = resp.json()
 
-        audio_b64 = None
-        if "choices" in data:
-            for choice in data["choices"]:
-                msg = choice.get("message", {})
-                if "audio" in msg:
-                    audio_b64 = msg["audio"].get("data")
-                    break
-        elif "audio" in data:
-            audio_b64 = data["audio"]
+        # Логируем структуру ответа (без base64 — он огромный)
+        def summarize(obj, d=0):
+            if d > 4:
+                return "..."
+            if isinstance(obj, dict):
+                return {k: summarize(v, d + 1) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [summarize(x, d + 1) for x in obj[:2]]
+            if isinstance(obj, str):
+                return f"<str len={len(obj)}>"
+            return obj
 
+        print(f"[ACE Music] Структура ответа: {json.dumps(summarize(data), ensure_ascii=False)}")
+
+        audio_b64 = find_audio_base64(data)
         if not audio_b64:
-            return None, f"ACE Music API вернул ответ без аудио: {str(data)[:200]}"
+            return None, f"ACE Music API вернул ответ без аудио. Структура: {json.dumps(summarize(data), ensure_ascii=False)[:300]}"
 
         return f"data:audio/mp3;base64,{audio_b64}", None
 
     except requests.exceptions.Timeout:
-        return None, "ACE Music API: превышено время ожидания (300 сек). Попробуй короче трек."
+        return None, "ACE Music API: превышено время ожидания (300 сек)."
     except requests.exceptions.RequestException as e:
         return None, f"ACE Music API: ошибка сети — {e}"
     except Exception as e:
@@ -154,7 +211,6 @@ def generate():
     theme = (data.get("theme") or "").strip()
     genre = (data.get("genre") or "pop").strip()
 
-    # Минимум 30 секунд — ACE Music часто падает на коротких запросах
     duration = int(data.get("duration", 30))
     if duration < 30:
         duration = 30
@@ -164,10 +220,8 @@ def generate():
     if not theme:
         return jsonify({"error": "Тема не указана"}), 400
 
-    # Шаг 1: текст
     lyrics = generate_lyrics(theme, genre)
 
-    # Шаг 2: музыка — промпт обёрнут в <prompt>...</prompt>
     music_prompt = (
         f"<prompt>{genre} song, emotional, catchy melody, "
         f"theme about {theme}, russian vocals, warm atmosphere</prompt>"
