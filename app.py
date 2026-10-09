@@ -5,11 +5,10 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Разрешаем запросы с фронтенда
+CORS(app)
 
 # --- API ключи из переменных окружения ---
-GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "")
-GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET", "")
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "")   # Authorization key (Base64)
 ACE_MUSIC_API_KEY = os.getenv("ACE_MUSIC_API_KEY", "")
 
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -18,18 +17,20 @@ ACE_MUSIC_URL = "https://api.acemusic.ai/v1/chat/completions"
 
 
 def get_gigachat_token():
-    """Получает access token для GigaChat API."""
+    """Получает access token для GigaChat через Authorization key."""
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
         "RqUID": str(uuid.uuid4()),
+        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",  # ключ уже в Base64
     }
     data = {"scope": "GIGACHAT_API_PERS", "grant_type": "client_credentials"}
     try:
         resp = requests.post(
-            GIGACHAT_OAUTH_URL, headers=headers, data=data,
-            auth=(GIGACHAT_CLIENT_ID, GIGACHAT_CLIENT_SECRET),
-            verify=False,  # GigaChat использует самоподписанный сертификат
+            GIGACHAT_OAUTH_URL,
+            headers=headers,
+            data=data,
+            verify=False,
             timeout=30,
         )
         resp.raise_for_status()
@@ -41,7 +42,7 @@ def get_gigachat_token():
 
 def generate_lyrics(theme, genre="pop"):
     """Генерирует текст песни через GigaChat."""
-    if not GIGACHAT_CLIENT_ID or not GIGACHAT_CLIENT_SECRET:
+    if not GIGACHAT_AUTH_KEY:
         return (
             f"[Verse 1]\nЯ пою про {theme},\nСлова летят сквозь тишину...\n\n"
             f"[Chorus]\n{theme}, {theme},\nМы с тобой в одном огне."
@@ -49,7 +50,7 @@ def generate_lyrics(theme, genre="pop"):
 
     token = get_gigachat_token()
     if not token:
-        return "Ошибка авторизации в GigaChat. Проверь ключи."
+        return "Ошибка авторизации в GigaChat. Проверь GIGACHAT_AUTH_KEY."
 
     prompt = (
         f"Ты профессиональный поэт-песенник. Напиши текст песни на русском языке.\n"
@@ -71,15 +72,17 @@ def generate_lyrics(theme, genre="pop"):
         "max_tokens": 2000,
     }
     try:
-        resp = requests.post(GIGACHAT_API_URL, headers=headers, json=payload,
-                             verify=False, timeout=60)
+        resp = requests.post(
+            GIGACHAT_API_URL, headers=headers, json=payload,
+            verify=False, timeout=60,
+        )
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
     except requests.exceptions.HTTPError:
         if resp.status_code == 429:
             return "Дневной лимит GigaChat исчерпан. Попробуй позже."
-        return f"Ошибка GigaChat API"
+        return "Ошибка GigaChat API"
     except Exception as e:
         return f"Ошибка генерации текста: {e}"
 
@@ -149,7 +152,11 @@ def generate():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "gigachat_configured": bool(GIGACHAT_AUTH_KEY),
+        "ace_music_configured": bool(ACE_MUSIC_API_KEY),
+    })
 
 
 if __name__ == "__main__":
