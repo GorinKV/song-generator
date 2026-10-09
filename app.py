@@ -90,17 +90,19 @@ def generate_lyrics(theme, genre="pop"):
 def generate_music(lyrics, prompt, duration=30):
     """Генерирует музыку с вокалом через ACE Music API."""
     if not ACE_MUSIC_API_KEY:
-        return None
+        return None, "ACE_MUSIC_API_KEY не задан в переменных окружения."
 
     headers = {
         "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
         "Content-Type": "application/json",
     }
+
+    # Промпт уже обёрнут в <prompt>...</prompt> в вызывающем коде
     payload = {
         "model": "acemusic/acestep-v15-turbo",
         "messages": [{
             "role": "user",
-            "content": f"<prompt>{prompt}</prompt><lyrics>{lyrics}</lyrics>",
+            "content": f"{prompt}<lyrics>{lyrics}</lyrics>",
         }],
         "stream": False,
         "audio_config": {
@@ -109,10 +111,20 @@ def generate_music(lyrics, prompt, duration=30):
             "duration": duration,
         },
     }
+
     try:
         resp = requests.post(ACE_MUSIC_URL, headers=headers, json=payload, timeout=300)
+
+        if resp.status_code == 504:
+            return None, "ACE Music API: таймаут (504). Попробуй увеличить длительность или повторить позже."
+        if resp.status_code == 401:
+            return None, "ACE Music API: неверный ключ (401). Проверь ACE_MUSIC_API_KEY."
+        if resp.status_code == 429:
+            return None, "ACE Music API: превышен лимит запросов (429)."
+
         resp.raise_for_status()
         data = resp.json()
+
         audio_b64 = None
         if "choices" in data:
             for choice in data["choices"]:
@@ -122,11 +134,18 @@ def generate_music(lyrics, prompt, duration=30):
                     break
         elif "audio" in data:
             audio_b64 = data["audio"]
+
         if not audio_b64:
-            return None
-        return f"data:audio/mp3;base64,{audio_b64}"
-    except Exception:
-        return None
+            return None, f"ACE Music API вернул ответ без аудио: {str(data)[:200]}"
+
+        return f"data:audio/mp3;base64,{audio_b64}", None
+
+    except requests.exceptions.Timeout:
+        return None, "ACE Music API: превышено время ожидания (300 сек). Попробуй короче трек."
+    except requests.exceptions.RequestException as e:
+        return None, f"ACE Music API: ошибка сети — {e}"
+    except Exception as e:
+        return None, f"ACE Music API: неизвестная ошибка — {e}"
 
 
 @app.route("/api/generate", methods=["POST"])
@@ -134,19 +153,33 @@ def generate():
     data = request.json or {}
     theme = (data.get("theme") or "").strip()
     genre = (data.get("genre") or "pop").strip()
-    duration = min(int(data.get("duration", 30)), 120)
+
+    # Минимум 30 секунд — ACE Music часто падает на коротких запросах
+    duration = int(data.get("duration", 30))
+    if duration < 30:
+        duration = 30
+    if duration > 120:
+        duration = 120
+
     if not theme:
         return jsonify({"error": "Тема не указана"}), 400
 
+    # Шаг 1: текст
     lyrics = generate_lyrics(theme, genre)
-    music_prompt = f"{genre} song, emotional, catchy melody, theme about {theme}"
-    music_data_uri = generate_music(lyrics, music_prompt, duration)
+
+    # Шаг 2: музыка — промпт обёрнут в <prompt>...</prompt>
+    music_prompt = (
+        f"<prompt>{genre} song, emotional, catchy melody, "
+        f"theme about {theme}, russian vocals, warm atmosphere</prompt>"
+    )
+    music_data_uri, music_error = generate_music(lyrics, music_prompt, duration)
 
     return jsonify({
         "lyrics": lyrics,
         "music_url": music_data_uri,
         "has_music": music_data_uri is not None,
-        "music_error": None if music_data_uri else "ACE Music API не вернул аудио.",
+        "music_error": music_error,
+        "duration_used": duration,
     })
 
 
