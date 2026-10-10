@@ -26,10 +26,8 @@ def get_gigachat_token():
     }
     data = {"scope": "GIGACHAT_API_PERS", "grant_type": "client_credentials"}
     try:
-        resp = requests.post(
-            GIGACHAT_OAUTH_URL, headers=headers, data=data,
-            verify=False, timeout=30,
-        )
+        resp = requests.post(GIGACHAT_OAUTH_URL, headers=headers, data=data,
+                             verify=False, timeout=30)
         resp.raise_for_status()
         return resp.json().get("access_token")
     except Exception as e:
@@ -62,30 +60,52 @@ def generate_lyrics(theme, genre="pop"):
         "max_tokens": 2000,
     }
     try:
-        resp = requests.post(
-            GIGACHAT_API_URL, headers=headers, json=payload,
-            verify=False, timeout=60,
-        )
+        resp = requests.post(GIGACHAT_API_URL, headers=headers, json=payload,
+                             verify=False, timeout=60)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"Ошибка генерации текста: {e}"
 
 
-def detect_audio_mime(b64_str):
-    """Определяет MIME-тип по первым байтам base64-строки."""
-    try:
-        sample = b64_str[:200]
-        sample += "=" * ((4 - len(sample) % 4) % 4)
-        raw = base64.b64decode(sample, validate=False)
-    except Exception:
-        return "audio/mpeg"
+def collect_all_strings(obj, path=""):
+    results = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            results.extend(collect_all_strings(v, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            results.extend(collect_all_strings(v, f"{path}[{i}]"))
+    elif isinstance(obj, str):
+        results.append((path, obj))
+    return results
 
+
+def decode_first_bytes(b64_str):
+    s = b64_str
+    if s.startswith("data:"):
+        try:
+            s = s.split(",", 1)[1]
+        except Exception:
+            return None, "no comma in data url"
+    s = s.replace("\n", "").replace("\r", "")
+    sample = s[:400]
+    sample += "=" * ((4 - len(sample) % 4) % 4)
+    try:
+        raw = base64.b64decode(sample, validate=False)
+        return raw[:16], raw[:16].hex()
+    except Exception as e:
+        return None, f"decode error: {e}"
+
+
+def detect_mime_from_bytes(raw):
+    if not raw:
+        return "application/octet-stream"
     if raw[:3] == b"ID3":
         return "audio/mpeg"
-    if len(raw) >= 2 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0:
+    if raw[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xfa", b"\xff\xf2"):
         return "audio/mpeg"
-    if raw[:4] == b"RIFF" and len(raw) >= 12 and raw[8:12] == b"WAVE":
+    if raw[:4] == b"RIFF":
         return "audio/wav"
     if raw[:4] == b"OggS":
         return "audio/ogg"
@@ -93,41 +113,28 @@ def detect_audio_mime(b64_str):
         return "audio/flac"
     if len(raw) >= 8 and raw[4:8] == b"ftyp":
         return "audio/mp4"
-    return "audio/mpeg"
-
-
-def find_all_long_strings(obj, min_len=5000, path=""):
-    """Рекурсивно ищет все строки длиннее min_len."""
-    results = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            results.extend(find_all_long_strings(v, min_len, f"{path}.{k}"))
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            results.extend(find_all_long_strings(v, min_len, f"{path}[{i}]"))
-    elif isinstance(obj, str) and len(obj) >= min_len:
-        results.append((path, obj))
-    return results
-
-
-def debug_dump(obj, max_str=80, depth=0, max_depth=8):
-    """Сжимает структуру для лога (обрезает длинные строки)."""
-    if depth > max_depth:
-        return "..."
-    if isinstance(obj, dict):
-        return {k: debug_dump(v, max_str, depth + 1, max_depth) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [debug_dump(x, max_str, depth + 1, max_depth) for x in obj[:3]]
-    if isinstance(obj, str):
-        if len(obj) > max_str:
-            return f"<str len={len(obj)} head={obj[:max_str]!r}>"
-        return obj
-    return obj
+    if raw[:4] == b"\x1aE\xdf\xa3":
+        return "audio/webm"
+    return "application/octet-stream"
 
 
 def generate_music(lyrics, prompt, duration=30):
+    """Возвращает (audio_data_url, error, debug_info)."""
+    debug = {
+        "stage": "start",
+        "strings_count": 0,
+        "top_strings": [],
+        "chosen_path": None,
+        "chosen_len": None,
+        "hex_head": None,
+        "mime": None,
+        "raw_preview": None,
+        "error": None,
+    }
+
     if not ACE_MUSIC_API_KEY:
-        return None, "ACE_MUSIC_API_KEY не задан."
+        debug["error"] = "ACE_MUSIC_API_KEY не задан."
+        return None, debug["error"], debug
 
     headers = {
         "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
@@ -149,61 +156,94 @@ def generate_music(lyrics, prompt, duration=30):
 
     try:
         resp = requests.post(ACE_MUSIC_URL, headers=headers, json=payload, timeout=300)
+        debug["stage"] = f"got_http_{resp.status_code}"
 
         if resp.status_code == 504:
-            return None, "ACE Music API: таймаут (504)."
+            debug["error"] = "таймаут (504)"
+            return None, "ACE Music: таймаут (504).", debug
         if resp.status_code == 401:
-            return None, "ACE Music API: неверный ключ (401)."
+            debug["error"] = "неверный ключ (401)"
+            return None, "ACE Music: неверный ключ (401).", debug
         if resp.status_code == 429:
-            return None, "ACE Music API: превышен лимит (429)."
+            debug["error"] = "превышен лимит (429)"
+            return None, "ACE Music: превышен лимит (429).", debug
 
         resp.raise_for_status()
         data = resp.json()
+        debug["stage"] = "parsed_json"
 
-        # Полный дамп структуры
-        dump = debug_dump(data, max_str=100)
-        print(f"[ACE Music] Дамп: {json.dumps(dump, ensure_ascii=False)}")
+        # Собираем все строки
+        all_strings = collect_all_strings(data)
+        debug["strings_count"] = len(all_strings)
 
-        # Проверяем message.content (может быть текст ошибки)
-        try:
-            content = data["choices"][0]["message"].get("content", "")
-            print(f"[ACE Music] message.content = {content!r}")
-        except Exception:
-            pass
+        # Сортируем по длине
+        all_strings.sort(key=lambda x: len(x[1]), reverse=True)
 
-        # Ищем длинные строки — от 5000 символов
-        candidates = find_all_long_strings(data, min_len=5000)
-        print(f"[ACE Music] Строк >5000: {len(candidates)}")
+        # Топ-5 для отладки
+        for p, s in all_strings[:5]:
+            debug["top_strings"].append({
+                "path": p,
+                "len": len(s),
+                "head": s[:80],
+                "is_data_url": s.startswith("data:"),
+                "is_http_url": s.startswith(("http://", "https://")),
+            })
 
+        candidates = [(p, s) for p, s in all_strings if len(s) > 5000]
         if not candidates:
-            # Пробуем порог ниже
-            candidates = find_all_long_strings(data, min_len=1000)
-            print(f"[ACE Music] Строк >1000: {len(candidates)}")
+            debug["error"] = f"нет строк >5000. Всего {len(all_strings)}"
+            return None, debug["error"], debug
 
-        for path, val in candidates:
-            print(f"  {path}: len={len(val)}, head={val[:60]!r}")
+        path, audio_str = candidates[0]
+        debug["chosen_path"] = path
+        debug["chosen_len"] = len(audio_str)
+        debug["raw_preview"] = audio_str[:120]
 
-        if not candidates:
-            return None, f"Нет аудио-строк в ответе. Дамп: {json.dumps(dump, ensure_ascii=False)[:400]}"
+        # data URL
+        if audio_str.startswith("data:"):
+            debug["mime"] = audio_str[5:25]
+            return audio_str, None, debug
 
-        # Берём самую длинную
-        path, audio_str = max(candidates, key=lambda x: len(x[1]))
-        print(f"[ACE Music] Выбрано: {path}, длина={len(audio_str)}")
-
-        # Если это URL — отдаём напрямую
+        # http URL
         if audio_str.startswith(("http://", "https://")):
-            return audio_str, None
+            debug["mime"] = "http-url"
+            return audio_str, None, debug
 
-        # Определяем MIME по магическим байтам
-        mime = detect_audio_mime(audio_str)
-        print(f"[ACE Music] MIME: {mime}")
+        # base64 — декодируем первые байты
+        raw_bytes, hex_repr = decode_first_bytes(audio_str)
+        debug["hex_head"] = hex_repr
 
-        return f"data:{mime};base64,{audio_str}", None
+        if not raw_bytes:
+            debug["error"] = f"decode failed: {hex_repr}"
+            return None, debug["error"], debug
+
+        mime = detect_mime_from_bytes(raw_bytes)
+        debug["mime"] = mime
+
+        if mime == "application/octet-stream":
+            # Пробуем base64url
+            cleaned = audio_str.replace("\n", "").replace("\r", "")
+            cleaned = cleaned.replace("-", "+").replace("_", "/")
+            raw_bytes2, hex_repr2 = decode_first_bytes(cleaned)
+            debug["hex_head_cleaned"] = hex_repr2
+            if raw_bytes2:
+                mime2 = detect_mime_from_bytes(raw_bytes2)
+                debug["mime_cleaned"] = mime2
+                if mime2 != "application/octet-stream":
+                    return f"data:{mime2};base64,{cleaned}", None, debug
+            debug["error"] = f"неизвестный формат, hex={hex_repr}"
+            return None, debug["error"], debug
+
+        return f"data:{mime};base64,{audio_str}", None, debug
 
     except requests.exceptions.Timeout:
-        return None, "ACE Music API: превышено время ожидания."
+        debug["error"] = "timeout"
+        return None, "ACE Music: превышено время ожидания.", debug
     except Exception as e:
-        return None, f"ACE Music API: ошибка — {e}"
+        import traceback
+        debug["error"] = f"{e}"
+        debug["traceback"] = traceback.format_exc()
+        return None, f"ACE Music: ошибка — {e}", debug
 
 
 @app.route("/api/generate", methods=["POST"])
@@ -223,7 +263,7 @@ def generate():
         f"<prompt>{genre} song, emotional, catchy melody, "
         f"theme about {theme}, russian vocals</prompt>"
     )
-    music_url, music_error = generate_music(lyrics, music_prompt, duration)
+    music_url, music_error, debug = generate_music(lyrics, music_prompt, duration)
 
     return jsonify({
         "lyrics": lyrics,
@@ -231,6 +271,7 @@ def generate():
         "has_music": music_url is not None,
         "music_error": music_error,
         "duration_used": duration,
+        "debug": debug,
     })
 
 
